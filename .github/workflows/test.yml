@@ -1,0 +1,34 @@
+name: test
+
+# The pool's own correctness gate: lint the scripts and run the offline
+# allocator suite. Deliberately NOT owner-guarded — unlike demo.yml it
+# costs seconds, and a fork that has not set POOL_HOME_OWNER yet should
+# still see real results rather than a wall of skipped checks. Mirrors
+# have it disabled by pool-sync anyway.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck .github/scripts/pool/*.sh
+      - name: allocator suite (offline)
+        run: .github/scripts/pool/selftest.sh
+      - name: workflows parse
+        run: |
+          for f in .github/workflows/*.yml; do
+            python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f"
+          done
+          jq -e . .github/pool.json >/dev/null
+          echo "all workflow files and pool.json parse"

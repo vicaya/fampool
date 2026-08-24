@@ -1,0 +1,51 @@
+name: host-runner
+
+# Donor entry point. The allocator in the consumer repo dispatches this
+# with a single-use JIT runner config; this job rents a GitHub-hosted
+# runner on the donor's minutes, points the runner agent at the consumer
+# repo, serves exactly one job, and exits.
+#
+# It ships with the project so every synced mirror carries an identical
+# copy — the allocator refuses to dispatch a mirror whose copy differs.
+# In the home repo it is inert: it only runs when dispatched, and the
+# allocator never dispatches at home.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jit_config:
+        description: Single-use JIT runner config minted by the pool allocator
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    # Total cap on donor minutes this job can burn. A JIT runner exits on
+    # its own once it has served its single job; this bound is what stops
+    # a runner nobody ever sends work to from idling for the full 6h
+    # hosted-job limit. Keep pooled consumer jobs comfortably under it.
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the runner agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(curl -sSL https://api.github.com/repos/actions/runner/releases/latest |
+            jq -r .tag_name)
+          ver="${ver#v}"
+          echo "actions/runner v$ver"
+          curl -sSL -o runner.tar.gz \
+            "https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz"
+          mkdir -p runner
+          tar xzf runner.tar.gz -C runner
+
+      - name: Serve one job for the consumer repo
+        env:
+          JIT_CONFIG: ${{ inputs.jit_config }}
+        working-directory: runner
+        # --jitconfig registers, runs a single job, deregisters, exits.
+        # No token is persisted and no runner record survives the job.
+        run: ./run.sh --jitconfig "$JIT_CONFIG"

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Shared helpers for the Actions minute pool. Sourced by allocate.sh and
+# sync.sh; runs on GitHub-hosted runners, where curl and jq are already
+# installed.
+#
+# Credentials: POOL_PAT, one token that can reach every participating
+# account. The pool_token seam below is where a GitHub App installation
+# token would be swapped in for a larger deployment (see README §Scaling).
+set -euo pipefail
+
+GH_API="${GH_API:-https://api.github.com}"
+
+# api <token> <method> <path> [json-body] — prints the response body,
+# non-zero exit on HTTP >= 400.
+api() {
+  local token="$1" method="$2" path="$3" body="${4:-}"
+  local args=(-sS --fail-with-body -X "$method"
+    -H "Authorization: Bearer $token"
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28")
+  [[ -n "$body" ]] && args+=(-d "$body")
+  curl "${args[@]}" "$GH_API$path"
+}
+
+have_pool_creds() {
+  [[ -n "${POOL_PAT:-}" ]]
+}
+
+# pool_token <owner/repo> — a token that can reach the given repository.
+# The argument is unused with a PAT (one token reaches everything); it is
+# the seam an App-based deployment mints a per-installation token from.
+pool_token() {
+  [[ -n "${POOL_PAT:-}" ]] || return 1
+  printf '%s' "$POOL_PAT"
+}

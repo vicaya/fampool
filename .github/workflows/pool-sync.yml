@@ -1,0 +1,35 @@
+name: pool-sync
+
+# Keeps every donor mirror an exact copy of this repo and leaves only
+# host-runner.yml enabled there. Runs daily, on demand, and whenever the
+# pool machinery itself changes (a mirror serving stale runner code is
+# what the allocator's drift check refuses to dispatch).
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/pool.json"
+      - ".github/scripts/pool/**"
+      - ".github/workflows/host-runner.yml"
+      - ".github/workflows/pool-sync.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository_owner == vars.POOL_HOME_OWNER
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          POOL_PAT: ${{ secrets.POOL_PAT }}
+        run: .github/scripts/pool/sync.sh

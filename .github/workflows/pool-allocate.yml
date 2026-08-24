@@ -1,0 +1,49 @@
+name: pool-allocate
+
+# Reusable allocator. Call it as a job, then point downstream jobs at
+# its output:
+#
+#   allocate:
+#     if: github.repository_owner == vars.POOL_HOME_OWNER
+#     uses: ./.github/workflows/pool-allocate.yml
+#     with:
+#       count: 1          # runners = number of parallel pooled jobs
+#     secrets: inherit    # required — passes POOL_PAT through
+#   my-job:
+#     needs: allocate
+#     runs-on: ${{ fromJSON(needs.allocate.outputs.runs_on) }}
+#
+# Emits either a pooled-runner label array or "ubuntu-latest". Callers
+# never fail because the pool is empty; they just run at home.
+
+on:
+  workflow_call:
+    inputs:
+      count:
+        description: Number of pooled runners to provision (one per parallel job)
+        type: number
+        required: false
+        default: 1
+    outputs:
+      runs_on:
+        description: JSON for runs-on — a pooled label array or "ubuntu-latest"
+        value: ${{ jobs.allocate.outputs.runs_on }}
+
+permissions:
+  contents: read
+
+jobs:
+  allocate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      runs_on: ${{ steps.pick.outputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: pick
+        env:
+          COUNT: ${{ inputs.count }}
+          POOL_PAT: ${{ secrets.POOL_PAT }}
+        run: .github/scripts/pool/allocate.sh
