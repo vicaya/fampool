@@ -11,22 +11,22 @@ set -euo pipefail
 # Examples:
 #
 #   GITHUB_TOKEN=github_pat_... \
-#     ./github-actions-minutes.sh --user alice --included 3000
+#     scripts/gam.sh --user alice --included 3000
 #
 #   GITHUB_TOKEN=github_pat_... \
-#     ./github-actions-minutes.sh --org acme --included 3000
+#     scripts/gam.sh --org acme --included 3000
 #
 # Test a specific token environment variable:
 #
 #   GH_TOKEN_TEST=github_pat_... \
-#     ./github-actions-minutes.sh \
+#     scripts/gam.sh \
 #       --org acme \
 #       --included 3000 \
 #       --token-env GH_TOKEN_TEST
 #
 # Query a different month:
 #
-#   ./github-actions-minutes.sh \
+#   scripts/gam.sh \
 #     --user alice \
 #     --included 3000 \
 #     --year 2026 \

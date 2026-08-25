@@ -119,7 +119,7 @@ defaults() {
   : >"$STUB_TOKEN_LOG"
   # Case-local credentials must not leak into the next case.
   unset DONOR_ACCT_PAT MISSING_PAT
-  unset COUNT
+  unset COUNT POOL_CONFIRM_MAX
   write_config 240 "[$(donor_json donor-acct "$INCLUDED")]"
 }
 
@@ -138,7 +138,9 @@ run() {
   : >"$GITHUB_STEP_SUMMARY"
   local start=$SECONDS
   RC=0
-  OUT=$("$ALLOC" 2>&1) || RC=$?
+  # Hard kill: a bug that makes the allocator wait forever has to fail a
+  # case, not hang the suite. 124 is timeout(1) reporting exactly that.
+  OUT=$(timeout "${CASE_TIMEOUT:-60}" "$ALLOC" 2>&1) || RC=$?
   ELAPSED=$((SECONDS - start))
   GOT=$(sed -n 's/^runs_on=//p' "$GITHUB_OUTPUT")
 }
@@ -155,7 +157,9 @@ report() { # <case name> <ok|message>
 }
 
 verdict() { # <expected runs_on> — "" when the run decided correctly
-  if ((RC != 0)); then
+  if ((RC == 124)); then
+    printf '      allocator did not finish within %ds\n' "${CASE_TIMEOUT:-60}"
+  elif ((RC != 0)); then
     printf '      allocator exited %d (it must always exit 0)\n' "$RC"
   elif [[ "$GOT" != "$1" ]]; then
     printf '      expected runs_on=%s\n      got      runs_on=%s\n' \
@@ -328,6 +332,17 @@ defaults
 write_config 3 "[$(donor_json d1 "$INCLUDED"),$(donor_json d2 "$INCLUDED"),$(donor_json d3 "$INCLUDED")]"
 export STUB_DISPATCHED_RUNS=0
 check_within "three dead donors share one confirm budget" "$HOME_RUNNER" 6
+
+# A confirmation window longer than the allocator job's own
+# timeout-minutes would get the job killed mid-poll: no runs_on written,
+# every `needs: allocate` job skipped instead of falling back — the one
+# outcome the design promises cannot happen. Config must not be able to
+# reach it, so the window is clamped. POOL_CONFIRM_MAX stands in for the
+# 240s ceiling to keep the case fast.
+defaults
+write_config 9999 "[$(donor_json donor-acct "$INCLUDED")]"
+export STUB_DISPATCHED_RUNS=0 POOL_CONFIRM_MAX=2
+check_within "confirm window clamped to the job timeout" "$HOME_RUNNER" 5
 
 # Short of the runners asked for, so the allocator gives up — and the
 # run the donor did create has to be cancelled, or it burns donor

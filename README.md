@@ -112,11 +112,14 @@ duplicate CI on the minutes you are trying to save.
 }
 ```
 
-`reserve_floor_minutes` is the cushion left untouched in each account, so
-pooling never strands one at zero for its own work — and, applied to home, it
-is what tells the allocator that home is the account that needs to borrow.
-`account_type` picks the billing path (`org` vs `user`) and must match the
-account.
+`reserve_floor_minutes` keeps pooling from stranding an account at zero for
+its own work — and, applied to home, it is what tells the allocator that home
+is the account that needs to borrow. It is an **admission check, not a
+running balance**: an account is read once when a job is allocated, and a
+donor sitting a minute above the floor can still be taken well below it by
+the job it accepts. Size it against the longest job you would pool, not
+against zero. `account_type` picks the billing path (`org` vs `user`) and
+must match the account.
 
 `included_minutes` is each account's monthly allowance — 2000 on Free, 3000
 on Pro and Team, [whatever your plan
@@ -140,8 +143,11 @@ that a donor accepted the dispatch and created a run — a budget for the
 **whole** allocation, shared across donors, not a per-donor timeout. It does
 *not* wait for the runner to come online; see
 [What the allocator waits for](#what-the-allocator-waits-for). `0` skips
-confirmation and emits the pooled label immediately. Keep it well under the
-allocator job's `timeout-minutes` (5) in `pool-allocate.yml`.
+confirmation and emits the pooled label immediately, and anything above 240s
+is clamped to 240s — a window that outlived the allocator job's own
+`timeout-minutes` (5, in `pool-allocate.yml`) would get the job killed before
+it wrote a `runs_on`, which is the one failure the design does not allow.
+Raise `POOL_CONFIRM_MAX` alongside that timeout if you need a longer window.
 
 **5. Run `pool-sync`** once from the Actions tab. Forks start with all
 workflows disabled; sync enables `host-runner.yml` in each mirror and
@@ -255,9 +261,10 @@ ok    no run created within the confirm window       "ubuntu-latest"
 ok    first donor rejects, second lends              ["pool-run-12345-1"]
 ok    confirmation disabled emits immediately        ["pool-run-12345-1"]
 ok    three dead donors share one confirm budget     "ubuntu-latest"
+ok    confirm window clamped to the job timeout      "ubuntu-latest"
 ok    partial dispatch is cancelled                  "ubuntu-latest"
 
-21 passed, 0 failed
+22 passed, 0 failed
 ```
 
 No network, no credentials, no repo. Add a case by setting `STUB_*`

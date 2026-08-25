@@ -42,7 +42,9 @@ jobs:
     # Must stay above pool.json's dispatch_confirm_seconds, which the
     # allocator spends as one budget for the whole attempt. Killed here
     # instead, no runs_on output exists and every `needs: allocate` job
-    # is skipped rather than falling back to home runners. Five minutes
+    # is skipped rather than falling back to home runners — so the script
+    # clamps that window to 240s rather than trusting config to respect
+    # this number (POOL_CONFIRM_MAX; raise both together). Five minutes
     # is far more than confirming a dispatch can honestly need, so a hang
     # shows up as a failure rather than as ten more billed minutes.
     timeout-minutes: 5

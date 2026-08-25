@@ -24,6 +24,7 @@
 #   POOL_CONFIG         config path (default .github/pool.json)
 #   POOL_PAT            credentials, see lib.sh
 #   POOL_POLL_SECONDS   confirmation poll interval (default 10; 1 in tests)
+#   POOL_CONFIRM_MAX    ceiling on the confirmation window (default 240)
 #   POOL_LIB            helper library path (default: sibling lib.sh)
 #   POOL_BILLING_YEAR   billing month to query (default: current UTC)
 #   POOL_BILLING_MONTH
@@ -62,7 +63,19 @@ have_pool_creds ||
 [[ -f "$CONFIG" ]] || fallback "no $CONFIG — home runners"
 
 RESERVE=$(jq -r '.reserve_floor_minutes // 500' "$CONFIG")
+
+# The confirmation window is clamped, not merely documented. "Always
+# emits exactly one runs_on" is the invariant the whole design leans on,
+# and a window outliving pool-allocate.yml's timeout-minutes voids it:
+# the job is killed mid-poll, no output is ever written, and every
+# `needs: allocate` job is skipped instead of falling back to home
+# runners. That must not be reachable from config. The default ceiling
+# leaves a minute of headroom under the 5-minute job timeout for the
+# pre-loop API calls and per-donor work; raise both together.
+CONFIRM_MAX="${POOL_CONFIRM_MAX:-240}"
 CONFIRM=$(jq -r '.dispatch_confirm_seconds // 30' "$CONFIG")
+[[ "$CONFIRM" =~ ^[0-9]+$ ]] || CONFIRM=30
+((CONFIRM > CONFIRM_MAX)) && CONFIRM=$CONFIRM_MAX
 
 CONSUMER_TOK=$(pool_token "$CONSUMER") ||
   fallback "cannot mint a token for $CONSUMER"
