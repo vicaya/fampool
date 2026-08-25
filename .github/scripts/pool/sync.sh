@@ -4,7 +4,11 @@
 # enabled (forks start with all workflows off), everything else disabled
 # so a sync push never launches duplicate CI on donor minutes.
 #
-# Both API calls are idempotent, so re-running is always safe.
+# Both API calls are idempotent, so re-running is always safe. Any donor
+# left in a state the pool cannot use — push rejected, workflow list
+# unreadable, host-runner.yml not enabled, another workflow still active
+# — exits non-zero, so the sync job goes red instead of reporting a pool
+# that is quietly not there.
 #
 # Inputs (env): POOL_CONFIG, POOL_PAT, POOL_LIB — see allocate.sh.
 set -euo pipefail
@@ -48,20 +52,35 @@ while read -r d; do
   host_id=$(jq -r --arg p "$HOST_WF" \
     '.workflows[] | select(.path == $p) | .id' <<<"$wfs")
   if [[ -n "$host_id" ]]; then
-    api "$tok" PUT "/repos/$slug/actions/workflows/$host_id/enable" >/dev/null || true
-    echo "$slug: host-runner.yml enabled"
+    # A rejected enable (token permission, org policy, a transient 5xx)
+    # leaves the mirror listed as a donor but unable to host anything, so
+    # it has to be reported rather than swallowed.
+    if api "$tok" PUT "/repos/$slug/actions/workflows/$host_id/enable" >/dev/null; then
+      echo "$slug: host-runner.yml enabled"
+    else
+      echo "::warning::$slug: could not enable $HOST_WF — mirror cannot host runners"
+      fail=1
+    fi
   else
-    # The workflows index can lag a just-pushed file; the next run heals it.
-    echo "::warning::$slug does not list $HOST_WF yet — re-run pool-sync later"
+    # Usually the workflows index lagging a just-pushed file, which the
+    # next run heals — but until then the mirror cannot host anything,
+    # and that is the state this job exists to report.
+    echo "::warning::$slug does not list $HOST_WF yet — re-run pool-sync"
+    fail=1
   fi
 
-  jq -r --arg p "$HOST_WF" \
-    '.workflows[] | select(.path != $p) | select(.state == "active") | [.id, .path] | @tsv' \
-    <<<"$wfs" |
-    while IFS=$'\t' read -r id path; do
-      api "$tok" PUT "/repos/$slug/actions/workflows/$id/disable" >/dev/null || true
+  # Process substitution, not a pipe: a `while` on the right of a pipe
+  # runs in a subshell, where fail=1 would be lost.
+  while IFS=$'\t' read -r id path; do
+    if api "$tok" PUT "/repos/$slug/actions/workflows/$id/disable" >/dev/null; then
       echo "$slug: disabled $path"
-    done
+    else
+      echo "::warning::$slug: could not disable $path — duplicate CI may run on donor minutes"
+      fail=1
+    fi
+  done < <(jq -r --arg p "$HOST_WF" \
+    '.workflows[] | select(.path != $p) | select(.state == "active") | [.id, .path] | @tsv' \
+    <<<"$wfs")
 done < <(jq -c '.donors[]' "$CONFIG")
 
 exit "$fail"

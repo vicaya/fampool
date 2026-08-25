@@ -10,14 +10,20 @@ set -euo pipefail
 
 GH_API="${GH_API:-https://api.github.com}"
 
-# api <token> <method> <path> [json-body] — prints the response body,
-# non-zero exit on HTTP >= 400.
+GH_API_VERSION="${GH_API_VERSION:-2022-11-28}"
+
+# api <token> <method> <path> [json-body] [api-version] — prints the
+# response body, non-zero exit on HTTP >= 400.
+#
+# The version argument is for endpoints that are not on the pinned
+# default: the billing usage summary the allocator ranks accounts with
+# only answers under 2026-03-10 (see allocate.sh remaining()).
 api() {
-  local token="$1" method="$2" path="$3" body="${4:-}"
+  local token="$1" method="$2" path="$3" body="${4:-}" version="${5:-$GH_API_VERSION}"
   local args=(-sS --fail-with-body -X "$method"
     -H "Authorization: Bearer $token"
     -H "Accept: application/vnd.github+json"
-    -H "X-GitHub-Api-Version: 2022-11-28")
+    -H "X-GitHub-Api-Version: $version")
   [[ -n "$body" ]] && args+=(-d "$body")
   curl "${args[@]}" "$GH_API$path"
 }

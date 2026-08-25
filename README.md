@@ -43,6 +43,7 @@ consumer repo.
 | `.github/workflows/pool-sync.yml` | Daily mirror sync |
 | `.github/workflows/demo.yml` | Borrows a runner and reports where it ran |
 | `.github/workflows/test.yml` | shellcheck + the offline suite |
+| `scripts/gam.sh` | Standalone minute check — the billing query the allocator ranks with |
 
 ## Setup
 
@@ -53,17 +54,31 @@ You need two accounts: a **home** account owning this repo, and one or more
 or mirror of the consumer — see [Terms of service](#terms-of-service) below,
 this is not incidental. Name it whatever you like.
 
-**2. Create a PAT** that can reach every participating account, with:
+**2. Create a classic PAT** that can reach every participating account:
 
 | Scope | Why |
 | --- | --- |
-| `repo` (or fine-grained: Administration → read & write) | mint JIT runner configs on the consumer |
-| `workflow` (or fine-grained: Actions → read & write) | dispatch `host-runner.yml` in mirrors |
-| `read:org` / `user` billing read | query remaining minutes |
+| `repo` | mint JIT runner configs on the consumer; push to the mirrors |
+| `workflow` | dispatch and cancel `host-runner.yml` in mirrors |
+| `read:org` (org donors) / `user` (personal donors) | read the billing usage summary |
 
-The billing scope is optional. Without it, `remaining` reads as *unknown* and
-the allocator simply tries donors in configured order — it still lends, it
-just cannot rank by who has the most left.
+**Classic, not fine-grained** — for a pool spanning more than one account.
+`POOL_PAT` is used as one credential for the consumer *and* every donor,
+while a fine-grained PAT is scoped to a single resource owner, so on a
+multi-owner pool it fails against every account but one. A fine-grained token
+works only when every participant lives under the same owner; it then needs
+Administration → read & write (JIT configs), Actions → read & write (dispatch
+and cancel), Contents → read & write (the mirror push), and the billing read
+for the account type — *Account Plan: read* for a user, *Organization
+Administration: read* for an org.
+
+The billing read is optional. Without it — or without `included_minutes` in
+the config below — an account ranks as *unknown*: the allocator still lends,
+it just cannot order donors by who has the most left. See
+[Ranking](#how-accounts-are-ranked).
+
+For pools that outgrow one credential, `pool_token` in `lib.sh` is the seam
+for per-owner tokens or a GitHub App installed on each account.
 
 **3. Configure the home repo** — Settings → Secrets and variables → Actions:
 
@@ -81,15 +96,37 @@ duplicate CI on the minutes you are trying to save.
   "reserve_floor_minutes": 500,
   "runner_wait_seconds": 240,
   "home_account_type": "user",
+  "home_included_minutes": 3000,
   "donors": [
-    { "owner": "some-org", "repo": "fampool", "account_type": "org" }
+    {
+      "owner": "some-org",
+      "repo": "fampool",
+      "account_type": "org",
+      "included_minutes": 3000
+    }
   ]
 }
 ```
 
-`reserve_floor_minutes` is the cushion left untouched in each donor, so
-pooling never strands an account at zero for its own work. `account_type`
-picks the billing endpoint (`org` vs `user`) and must match the account.
+`reserve_floor_minutes` is the cushion left untouched in each account, so
+pooling never strands one at zero for its own work — and, applied to home, it
+is what tells the allocator that home is the account that needs to borrow.
+`account_type` picks the billing path (`org` vs `user`) and must match the
+account.
+
+`included_minutes` is each account's monthly allowance — 2000 on Free, 3000
+on Pro and Team, [whatever your plan
+says](https://docs.github.com/en/billing/managing-billing-for-your-products/about-billing-for-github-actions).
+It has to be configured because GitHub's billing API reports *consumption*,
+not entitlement: the allocator reads minutes used from
+`/settings/billing/usage/summary` and subtracts. That is the same query
+`scripts/gam.sh --included` runs, so if `gam.sh` reports a number for an
+account, the allocator will too. Omit the field and that account ranks
+*unknown*.
+
+`runner_wait_seconds` is the budget for the **whole** allocation, shared
+across donors — not a per-donor timeout. Keep it comfortably under the
+allocator job's `timeout-minutes` (15) in `pool-allocate.yml`.
 
 **5. Run `pool-sync`** once from the Actions tab. Forks start with all
 workflows disabled; sync enables `host-runner.yml` in each mirror and
@@ -114,6 +151,42 @@ out — `home account leads the pool`, `below the reserve floor`, `drifted or
 absent`, and so on. **This is the design working, not a failure.** Every
 shortfall degrades to `ubuntu-latest`; nothing in the pool can break your CI.
 
+## How accounts are ranked
+
+Candidates are the home account plus every donor at or above the reserve
+floor, ordered by remaining included minutes. Home is in that list like any
+other account, and when it wins the pool simply stands down. Two cases do not
+follow from raw minutes:
+
+- **Unknown sorts below any readable number.** A donor whose allowance is
+  unconfigured, or whose billing the token cannot read, is a last resort
+  rather than a first pick.
+- **Except against a home account below the floor**, which sorts below even
+  unknown. A repo that is nearly out of minutes is the entire reason this
+  exists; an unknown donor is worth trying there, and home is not.
+
+## Checking an account's minutes
+
+`scripts/gam.sh` runs the allocator's billing query on its own, which is the
+quickest way to confirm a token can read an account before you add it as a
+donor:
+
+```console
+$ GITHUB_TOKEN=ghp_... scripts/gam.sh --user alice --included 3000
+{
+  "accountType": "user",
+  "account": "alice",
+  "includedMinutes": 3000,
+  "usedMinutes": 1160,
+  "remainingMinutes": 1840,
+  "overageMinutes": 0,
+  "percentUsed": 38.67
+}
+```
+
+It prints the accepted permissions from the response headers when the request
+is rejected, which is usually enough to see what the token is missing.
+
 ## Test it locally
 
 The allocator is nothing but API round trips, which normally means the only
@@ -129,11 +202,16 @@ ok    no donors configured                           "ubuntu-latest"
 ok    donor below the reserve floor                  "ubuntu-latest"
 ok    mirror host-runner.yml drifted                 "ubuntu-latest"
 ok    home account has the most minutes              "ubuntu-latest"
+ok    unknown donor loses to a healthy home          "ubuntu-latest"
 ok    runner never comes online                      "ubuntu-latest"
 ok    donor leads, runner is borrowed                ["pool-run-12345-1"]
 ok    unreadable billing still lends                 ["pool-run-12345-1"]
+ok    unknown donor beats an exhausted home          ["pool-run-12345-1"]
+ok    donor with no configured allowance still lends ["pool-run-12345-1"]
+ok    three dead donors share one wait budget        "ubuntu-latest"
+ok    abandoned dispatch is cancelled                "ubuntu-latest"
 
-10 passed, 0 failed
+15 passed, 0 failed
 ```
 
 No network, no credentials, no repo. Add a case by setting `STUB_*`
@@ -172,7 +250,16 @@ tokens beat one credential that can reach everything.
 ## Limits and gotchas
 
 - **Serial cost.** Allocation adds up to `runner_wait_seconds` (default 240s)
-  before a job starts. Worth it for a long job, not for a 30-second one.
+  before a job starts — a budget for the whole attempt, shared across donors,
+  not a fresh clock per candidate. Worth it for a long job, not for a
+  30-second one.
+- **The home account still pays for the control plane.** `allocate` and
+  `pool-sync` are ordinary GitHub-hosted jobs on the home account, about a
+  minute each. If home reaches a hard cutoff — included minutes exhausted and
+  overages blocked — those jobs cannot start, and a pool that cannot run its
+  allocator lends nothing. Keep `reserve_floor_minutes` above what your
+  allocations cost in a month, and treat the pool as something that stretches
+  a budget rather than something that runs on an account already at zero.
 - **Public repos are already free.** This is for private repos, where minutes
   are metered.
 - **The mirror must not drift.** The allocator compares the mirror's

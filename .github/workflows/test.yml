@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck .github/scripts/pool/*.sh
+        run: shellcheck .github/scripts/pool/*.sh scripts/*.sh
       - name: allocator suite (offline)
         run: .github/scripts/pool/selftest.sh
       - name: workflows parse
