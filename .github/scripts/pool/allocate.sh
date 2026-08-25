@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 # Pool allocator. Picks the account with the most remaining included
 # minutes, mints a single-use JIT runner config against this repo,
-# dispatches the donor mirror's host-runner.yml, waits for the runner to
-# register, and emits a `runs_on` value for downstream jobs to consume.
+# dispatches the donor mirror's host-runner.yml, confirms the donor
+# created a run, and emits a `runs_on` value for downstream jobs.
+#
+# It does not wait for the runner to come online. A job whose runs-on
+# names a self-hosted label simply queues, unbilled, until a matching
+# runner registers — while this job waiting for that would be billed to
+# the home account, the budget the pool exists to protect. So the
+# allocator confirms only that the donor accepted the dispatch and
+# created a run, which is what separates "queued, a runner is coming"
+# from "nothing is coming" (mirror disabled, revoked token, donor out of
+# minutes).
 #
 # Every shortfall degrades to "ubuntu-latest" on the home account rather
 # than failing: no credentials (fork PRs see no secrets), no config, a
 # missing or drifted host-runner.yml, every donor below the reserve
-# floor, or runners that never come online. CI never breaks because the
+# floor, or a dispatch that produces no run. CI never breaks because the
 # pool is empty.
 #
 # Inputs (env):
 #   COUNT               runners to provision (default 1)
 #   POOL_CONFIG         config path (default .github/pool.json)
 #   POOL_PAT            credentials, see lib.sh
-#   POOL_POLL_SECONDS   runner poll interval (default 10; 0 in tests)
+#   POOL_POLL_SECONDS   confirmation poll interval (default 10; 1 in tests)
 #   POOL_LIB            helper library path (default: sibling lib.sh)
 #   POOL_BILLING_YEAR   billing month to query (default: current UTC)
 #   POOL_BILLING_MONTH
@@ -32,7 +41,9 @@ POLL="${POOL_POLL_SECONDS:-10}"
 LABEL="pool-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
 HOST_WF=".github/workflows/host-runner.yml"
 # host-runner.yml sets `run-name: host-runner <pool_label>`, which is how
-# cancel_dispatched() finds the runs this allocation started.
+# dispatched_runs() and cancel_dispatched() find the runs this allocation
+# started — and only those, so a donor shared with another consumer repo
+# cannot have its runs mistaken for ours.
 RUN_TITLE="host-runner $LABEL"
 
 emit() { # <runs-on JSON> <reason>
@@ -51,7 +62,7 @@ have_pool_creds ||
 [[ -f "$CONFIG" ]] || fallback "no $CONFIG — home runners"
 
 RESERVE=$(jq -r '.reserve_floor_minutes // 500' "$CONFIG")
-WAIT=$(jq -r '.runner_wait_seconds // 240' "$CONFIG")
+CONFIRM=$(jq -r '.dispatch_confirm_seconds // 30' "$CONFIG")
 
 CONSUMER_TOK=$(pool_token "$CONSUMER") ||
   fallback "cannot mint a token for $CONSUMER"
@@ -184,6 +195,22 @@ cleanup_label() {
     done
 }
 
+# dispatched_runs <token> <owner/repo> — how many host-runner runs this
+# allocation has on the donor and has not finished. This is the whole
+# confirmation: the dispatch endpoint answers 204 with no run id, so the
+# run listing is the only evidence the donor accepted it.
+dispatched_runs() {
+  local n
+  n=$(api "$1" GET \
+    "/repos/$2/actions/workflows/host-runner.yml/runs?event=workflow_dispatch&per_page=50" 2>/dev/null |
+    jq --arg t "$RUN_TITLE" \
+      '[.workflow_runs[]?
+        | select(.display_title == $t)
+        | select(.status != "completed")] | length' 2>/dev/null) || n=0
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  echo "$n"
+}
+
 # Cancel host-runner runs this allocation dispatched to <owner/repo>.
 # A run still queued on the donor has registered no runner yet, so
 # cleanup_label finds nothing to deregister — left alone it would come
@@ -213,7 +240,7 @@ cancel_dispatched() { # <token> <owner/repo>
 # per-donor wait multiplies by the donor count and can outlive the
 # allocator job's own timeout, which would skip every `needs: allocate`
 # job instead of degrading to home runners.
-DEADLINE=$((SECONDS + WAIT))
+DEADLINE=$((SECONDS + CONFIRM))
 
 for entry in "${SORTED[@]}"; do
   IFS=$'\t' read -r _rank slug rem token_var <<<"$entry"
@@ -225,8 +252,10 @@ for entry in "${SORTED[@]}"; do
     fi
     fallback "home account $HOME_OWNER leads the pool (remaining: $rem min)"
   fi
-  if ((SECONDS >= DEADLINE)); then
-    echo "::warning::allocation budget of ${WAIT}s spent — not trying $slug"
+  # With confirmation off there is no budget to spend, so the guard only
+  # applies when there is a window to run out of.
+  if ((CONFIRM > 0 && SECONDS >= DEADLINE)); then
+    echo "::warning::confirmation budget of ${CONFIRM}s spent — not trying $slug"
     break
   fi
   echo "trying donor $slug (remaining: $rem min)"
@@ -262,24 +291,26 @@ for entry in "${SORTED[@]}"; do
   done
 
   if $ok; then
-    online=0
-    while ((SECONDS < DEADLINE)); do
-      online=$(api "$CONSUMER_TOK" GET \
-        "/repos/$CONSUMER/actions/runners?per_page=100" 2>/dev/null |
-        jq --arg l "$LABEL" \
-          '[.runners[]
-            | select(any(.labels[]; .name == $l))
-            | select(.status == "online")] | length') || online=0
-      ((online >= COUNT)) && break
-      sleep "$POLL"
-    done
-    if ((online >= COUNT)); then
-      emit "[\"$LABEL\"]" "$COUNT runner(s) lent by $slug (remaining before run: $rem min)"
+    if ((CONFIRM <= 0)); then
+      emit "[\"$LABEL\"]" \
+        "$COUNT runner(s) dispatched to $slug (remaining before run: $rem min), unconfirmed"
       exit 0
     fi
+    seen=$(dispatched_runs "$tok" "$slug")
+    while ((seen < COUNT)) && ((SECONDS < DEADLINE)); do
+      sleep "$POLL"
+      seen=$(dispatched_runs "$tok" "$slug")
+    done
+    if ((seen >= COUNT)); then
+      emit "[\"$LABEL\"]" \
+        "$COUNT runner(s) dispatched by $slug (remaining before run: $rem min); the job queues until they register"
+      exit 0
+    fi
+    echo "::warning::$slug created $seen of $COUNT host-runner run(s) in ${CONFIRM}s — skipping"
+  else
+    echo "::warning::$slug rejected the dispatch — skipping"
   fi
 
-  echo "::warning::donor $slug did not produce $COUNT online runner(s) within the allocation budget"
   cleanup_label
   cancel_dispatched "$tok" "$slug"
 done

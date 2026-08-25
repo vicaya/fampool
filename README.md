@@ -33,10 +33,10 @@ consumer repo.
 
 | Path | Role |
 | --- | --- |
-| `.github/pool.json` | Donor list with allowances and tokens, reserve floor, wait budget |
+| `.github/pool.json` | Donor list with allowances and tokens, reserve floor, confirm budget |
 | `.github/scripts/pool/lib.sh` | API wrapper + credential seam |
-| `.github/scripts/pool/allocate.sh` | Picks a donor, mints JIT config, dispatches, waits |
-| `.github/scripts/pool/sync.sh` | Keeps mirrors identical and correctly enabled |
+| `.github/scripts/pool/allocate.sh` | Picks a donor, mints JIT config, dispatches, confirms |
+| `.github/scripts/pool/sync.sh` | Keeps mirrors identical and enabled; reaps dead runner records |
 | `.github/scripts/pool/selftest.sh` | Offline tests for every allocator decision |
 | `.github/workflows/pool-allocate.yml` | Reusable allocator job |
 | `.github/workflows/host-runner.yml` | Donor side — hosts one runner, one job |
@@ -97,7 +97,7 @@ duplicate CI on the minutes you are trying to save.
 ```json
 {
   "reserve_floor_minutes": 500,
-  "runner_wait_seconds": 240,
+  "dispatch_confirm_seconds": 30,
   "home_account_type": "user",
   "home_included_minutes": 3000,
   "donors": [
@@ -135,9 +135,13 @@ and, for the home account, as `home_included_minutes`.
 set it when each owner has its own token, and add the matching `env:` line to
 the two workflows as step 3 describes.
 
-`runner_wait_seconds` is the budget for the **whole** allocation, shared
-across donors — not a per-donor timeout. Keep it comfortably under the
-allocator job's `timeout-minutes` (15) in `pool-allocate.yml`.
+`dispatch_confirm_seconds` is how long the allocator will wait for proof
+that a donor accepted the dispatch and created a run — a budget for the
+**whole** allocation, shared across donors, not a per-donor timeout. It does
+*not* wait for the runner to come online; see
+[What the allocator waits for](#what-the-allocator-waits-for). `0` skips
+confirmation and emits the pooled label immediately. Keep it well under the
+allocator job's `timeout-minutes` (5) in `pool-allocate.yml`.
 
 **5. Run `pool-sync`** once from the Actions tab. Forks start with all
 workflows disabled; sync enables `host-runner.yml` in each mirror and
@@ -150,7 +154,7 @@ Actions → **demo** → Run workflow. The job's summary tells you which account
 paid for it:
 
 ```
-Pool allocator: 1 runner(s) lent by some-org/fampool (remaining before run: 1840 min) → ["pool-run-1234-1"]
+Pool allocator: 1 runner(s) dispatched by some-org/fampool (remaining before run: 1840 min); the job queues until they register → ["pool-run-1234-1"]
 
 ## Demo job
 **POOLED — served by a donor account's minutes**
@@ -161,6 +165,31 @@ If no donor qualifies you get the fallback instead, with the reason spelled
 out — `home account leads the pool`, `below the reserve floor`, `drifted or
 absent`, and so on. **This is the design working, not a failure.** Every
 shortfall degrades to `ubuntu-latest`; nothing in the pool can break your CI.
+
+## What the allocator waits for
+
+The allocator confirms that the donor **created a run**, then emits the label
+and exits. It does not wait for the runner to register.
+
+That is a spending decision. The allocator runs on `ubuntu-latest`, so every
+second it waits is billed to the home account — the budget the whole design
+exists to protect, and Actions rounds every job up to the nearest minute.
+Waiting for registration cost about two billed minutes on a healthy donor and
+up to five when one failed. Confirming the dispatch costs about one, which is
+the floor for any design where a home-hosted job does the dispatching.
+
+Nothing is lost by not waiting, because a job whose `runs-on` names a
+self-hosted label with no matching runner does not fail — it **queues**,
+unbilled, until one registers. The label is deterministic (`GITHUB_RUN_ID`
+and the attempt number, decided before any network call), so there is nothing
+to discover by waiting.
+
+What the confirmation buys is the fallback. A dispatch that was rejected, or
+accepted but never turned into a run — mirror workflow disabled, revoked
+token, donor out of minutes — means no runner is coming, and a job pointed at
+that label would sit in the queue instead of running at home. Seeing the
+donor's run appear is what separates that from a runner that is simply on its
+way.
 
 ## How accounts are ranked
 
@@ -214,17 +243,21 @@ ok    donor below the reserve floor                  "ubuntu-latest"
 ok    mirror host-runner.yml drifted                 "ubuntu-latest"
 ok    home account has the most minutes              "ubuntu-latest"
 ok    unknown donor loses to a healthy home          "ubuntu-latest"
-ok    runner never comes online                      "ubuntu-latest"
 ok    donor leads, runner is borrowed                ["pool-run-12345-1"]
+ok    donor dispatched, no runner online yet         ["pool-run-12345-1"]
 ok    unreadable billing still lends                 ["pool-run-12345-1"]
 ok    unknown donor beats an exhausted home          ["pool-run-12345-1"]
 ok    unconfigured allowance defaults to 2000        "ubuntu-latest"
 ok    donor lends through its own token_var          ["pool-run-12345-1"]
 ok    donor whose token_var is unset is skipped      "ubuntu-latest"
-ok    three dead donors share one wait budget        "ubuntu-latest"
-ok    abandoned dispatch is cancelled                "ubuntu-latest"
+ok    dispatch rejected by the donor                 "ubuntu-latest"
+ok    no run created within the confirm window       "ubuntu-latest"
+ok    first donor rejects, second lends              ["pool-run-12345-1"]
+ok    confirmation disabled emits immediately        ["pool-run-12345-1"]
+ok    three dead donors share one confirm budget     "ubuntu-latest"
+ok    partial dispatch is cancelled                  "ubuntu-latest"
 
-17 passed, 0 failed
+21 passed, 0 failed
 ```
 
 No network, no credentials, no repo. Add a case by setting `STUB_*`
@@ -262,10 +295,20 @@ tokens beat one credential that can reach everything.
 
 ## Limits and gotchas
 
-- **Serial cost.** Allocation adds up to `runner_wait_seconds` (default 240s)
-  before a job starts — a budget for the whole attempt, shared across donors,
-  not a fresh clock per candidate. Worth it for a long job, not for a
-  30-second one.
+- **Allocation costs about a billed minute.** The allocator is itself a job
+  on `ubuntu-latest`, and Actions rounds every job up to the nearest minute,
+  so a pooled job spends roughly one home minute to move the rest of the work
+  onto a donor. Pooling a 30-second job therefore costs the home account more
+  than running it at home; the break-even is somewhere around two minutes of
+  job time, and it only gets better from there.
+- **A job whose runner never arrives queues, it does not fail.** That is what
+  makes not waiting affordable, and it is also the cost: GitHub holds a
+  queued job for up to 24 hours, and `timeout-minutes` does not apply —
+  it counts execution, not time spent waiting for a runner. `pool-sync`
+  reaps the dead runner registration, but nothing cancels the job; cancel it
+  from the Actions tab if a donor dies mid-flight. `dispatch_confirm_seconds`
+  is what keeps this rare: a donor that never creates a run is caught before
+  the label is ever emitted.
 - **The home account still pays for the control plane.** `allocate` and
   `pool-sync` are ordinary GitHub-hosted jobs on the home account, about a
   minute each. If home reaches a hard cutoff — included minutes exhausted and

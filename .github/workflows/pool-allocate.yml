@@ -39,11 +39,13 @@ jobs:
     # (included minutes gone, overages blocked) cannot start it, and a
     # pool whose allocator cannot run lends nothing; see README §Limits.
     runs-on: ubuntu-latest
-    # Must stay above pool.json's runner_wait_seconds, which the allocator
-    # spends as one budget for the whole attempt. Killed here instead, no
-    # runs_on output exists and every `needs: allocate` job is skipped
-    # rather than falling back to home runners.
-    timeout-minutes: 15
+    # Must stay above pool.json's dispatch_confirm_seconds, which the
+    # allocator spends as one budget for the whole attempt. Killed here
+    # instead, no runs_on output exists and every `needs: allocate` job
+    # is skipped rather than falling back to home runners. Five minutes
+    # is far more than confirming a dispatch can honestly need, so a hang
+    # shows up as a failure rather than as ten more billed minutes.
+    timeout-minutes: 5
     outputs:
       runs_on: ${{ steps.pick.outputs.runs_on }}
     steps:

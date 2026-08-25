@@ -1,6 +1,6 @@
 {
   "reserve_floor_minutes": 500,
-  "runner_wait_seconds": 240,
+  "dispatch_confirm_seconds": 30,
   "home_account_type": "user",
   "home_included_minutes": 3000,
   "donors": []

@@ -55,14 +55,18 @@ api() { # <token> <method> <path> [body] [api-version]
       jq -nc '{encoded_jit_config: "JIT-CONFIG-BLOB"}'
       ;;
     */actions/workflows/*/dispatches)
+      # A donor whose owner is named in STUB_DISPATCH_FAILS rejects the
+      # dispatch: mirror workflow disabled, revoked token, and so on.
+      [[ -n "$STUB_DISPATCH_FAILS" && "$path" == */repos/"$STUB_DISPATCH_FAILS"/* ]] &&
+        return 22
       echo "$1" >>"$STUB_TOKEN_LOG"
       echo '{}'
       ;;
     */actions/workflows/*/runs*)
-      # One dispatched run per donor, still queued: what the allocator
-      # has to cancel when it gives up before a runner registers.
-      jq -nc --arg t "host-runner $STUB_LABEL" \
-        '{workflow_runs: [{id: 777, display_title: $t, status: "queued"}]}'
+      # The runs the dispatch created, still queued — the allocator's
+      # whole confirmation, and what it cancels if it gives up anyway.
+      jq -nc --argjson n "$STUB_DISPATCHED_RUNS" --arg t "host-runner $STUB_LABEL" \
+        '{workflow_runs: [range($n) | {id: (777 + .), display_title: $t, status: "queued"}]}'
       ;;
     */actions/runs/*/cancel)
       echo "STUB-CANCELLED ${path}" >>"$STUB_CANCEL_LOG"
@@ -94,9 +98,9 @@ donor_json() { # <owner> [included_minutes] [token_var] — one donor entry
      + (if $t == "" then {} else {token_var: $t} end)'
 }
 
-write_config() { # <runner_wait_seconds> <donors-json-array>
+write_config() { # <dispatch_confirm_seconds> <donors-json-array>
   jq -n --argjson w "$1" --argjson d "$2" --argjson i "$INCLUDED" \
-    '{reserve_floor_minutes: 500, runner_wait_seconds: $w,
+    '{reserve_floor_minutes: 500, dispatch_confirm_seconds: $w,
       home_account_type: "user", home_included_minutes: $i,
       donors: $d}' >"$TMP/pool.json"
 }
@@ -108,12 +112,14 @@ defaults() {
   export STUB_CONSUMER="$CONSUMER" STUB_DONOR="$DONOR" STUB_LABEL="pool-run-12345-1"
   export STUB_CONSUMER_SHA=abc123 STUB_DONOR_SHA=abc123
   export STUB_DONOR_MIN=1500 STUB_HOME_MIN=100 STUB_ONLINE=1
+  export STUB_DISPATCHED_RUNS=1 STUB_DISPATCH_FAILS=""
   export STUB_INCLUDED="$INCLUDED" STUB_CANCEL_LOG="$TMP/cancelled"
   export STUB_TOKEN_LOG="$TMP/tokens"
   : >"$STUB_CANCEL_LOG"
   : >"$STUB_TOKEN_LOG"
   # Case-local credentials must not leak into the next case.
   unset DONOR_ACCT_PAT MISSING_PAT
+  unset COUNT
   write_config 240 "[$(donor_json donor-acct "$INCLUDED")]"
 }
 
@@ -238,14 +244,17 @@ defaults
 export STUB_DONOR_MIN=unknown STUB_HOME_MIN=1900
 check "unknown donor loses to a healthy home" "$HOME_RUNNER"
 
-defaults
-write_config 1 "[$(donor_json donor-acct "$INCLUDED")]"
-export STUB_ONLINE=0
-check "runner never comes online" "$HOME_RUNNER"
-
 # --- lending: the pool actually hands over a runner ---------------------
 defaults
 check "donor leads, runner is borrowed" "$POOLED"
+
+# The point of the no-wait design, and the inverse of what this suite
+# used to assert: a dispatched donor whose runner has not registered yet
+# is a success. The job queues, unbilled, until the runner arrives —
+# waiting here would be billed to the account the pool is protecting.
+defaults
+export STUB_ONLINE=0
+check "donor dispatched, no runner online yet" "$POOLED"
 
 defaults
 export STUB_DONOR_MIN=unknown STUB_HOME_MIN=unknown
@@ -282,23 +291,51 @@ write_config 240 "[$(donor_json donor-acct "$INCLUDED" MISSING_PAT)]"
 unset MISSING_PAT
 check "donor whose token_var is unset is skipped" "$HOME_RUNNER"
 
-# --- budgets and cleanup ------------------------------------------------
-# runner_wait_seconds is the budget for the whole allocation, not per
-# donor: three dead donors at 3s must still fall back in about 3s, not
-# 9s. Left per-donor it scales with the donor count and can outlive the
-# allocator job's own timeout — which skips every `needs: allocate` job
-# instead of degrading to home runners.
+# --- confirmation --------------------------------------------------------
+# A rejected dispatch is the failure worth catching: nothing is coming,
+# and a job pointed at that label would queue for a day.
 defaults
-write_config 3 "[$(donor_json d1 "$INCLUDED"),$(donor_json d2 "$INCLUDED"),$(donor_json d3 "$INCLUDED")]"
-export STUB_ONLINE=0
-check_within "three dead donors share one wait budget" "$HOME_RUNNER" 6
+export STUB_DISPATCH_FAILS=donor-acct
+check "dispatch rejected by the donor" "$HOME_RUNNER"
 
-# A donor that never registers a runner may still have a queued job
-# holding its minutes, so giving up on it has to cancel the dispatch.
+# Accepted but no run appeared — the donor is out of minutes, or has the
+# mirror workflow disabled. Same verdict, arrived at differently.
 defaults
 write_config 1 "[$(donor_json donor-acct "$INCLUDED")]"
-export STUB_ONLINE=0
-check_cancelled "abandoned dispatch is cancelled" "$HOME_RUNNER" 1
+export STUB_DISPATCHED_RUNS=0
+check "no run created within the confirm window" "$HOME_RUNNER"
+
+defaults
+write_config 240 "[$(donor_json d1 "$INCLUDED"),$(donor_json d2 "$INCLUDED")]"
+export STUB_DISPATCH_FAILS=d1
+check "first donor rejects, second lends" "$POOLED"
+
+# dispatch_confirm_seconds: 0 skips confirmation altogether. The stub
+# reports no runs at all, so anything but POOLED means the allocator
+# looked when it was told not to.
+defaults
+write_config 0 "[$(donor_json donor-acct "$INCLUDED")]"
+export STUB_DISPATCHED_RUNS=0
+check "confirmation disabled emits immediately" "$POOLED"
+
+# --- budgets and cleanup ------------------------------------------------
+# dispatch_confirm_seconds is the budget for the whole allocation, not
+# per donor: three dead donors at 3s must still fall back in about 3s,
+# not 9s. Left per-donor it scales with the donor count and can outlive
+# the allocator job's own timeout — which skips every `needs: allocate`
+# job instead of degrading to home runners.
+defaults
+write_config 3 "[$(donor_json d1 "$INCLUDED"),$(donor_json d2 "$INCLUDED"),$(donor_json d3 "$INCLUDED")]"
+export STUB_DISPATCHED_RUNS=0
+check_within "three dead donors share one confirm budget" "$HOME_RUNNER" 6
+
+# Short of the runners asked for, so the allocator gives up — and the
+# run the donor did create has to be cancelled, or it burns donor
+# minutes serving a job that will never be queued against its label.
+defaults
+write_config 1 "[$(donor_json donor-acct "$INCLUDED")]"
+export COUNT=2 STUB_DISPATCHED_RUNS=1
+check_cancelled "partial dispatch is cancelled" "$HOME_RUNNER" 1
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

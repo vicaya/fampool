@@ -10,7 +10,11 @@
 # — exits non-zero, so the sync job goes red instead of reporting a pool
 # that is quietly not there.
 #
-# Inputs (env): POOL_CONFIG, POOL_PAT, POOL_LIB — see allocate.sh.
+# It also reaps orphaned JIT runner registrations on the consumer repo;
+# see reap_runners below.
+#
+# Inputs (env): POOL_CONFIG, POOL_PAT, POOL_LIB, GITHUB_REPOSITORY — see
+# allocate.sh.
 set -euo pipefail
 
 # shellcheck disable=SC1090,SC1091  # sibling lib.sh; POOL_LIB redirects it in selftest.sh
@@ -83,5 +87,57 @@ while read -r d; do
     '.workflows[] | select(.path != $p) | select(.state == "active") | [.id, .path] | @tsv' \
     <<<"$wfs")
 done < <(jq -c '.donors[]' "$CONFIG")
+
+# Reap orphaned JIT runner registrations on the consumer repo.
+#
+# The allocator does not wait for a dispatched runner to come online, so
+# its cleanup cannot catch a registration that appears after it has
+# moved on — a donor job killed before it picked up work, or one that
+# registered against a run that has since finished. A JIT runner that
+# actually served a job deregisters itself, so anything still listed
+# offline whose allocating run is over never worked.
+#
+# The runners endpoint reports no creation time, which is why the run id
+# is read back out of the name the allocator minted
+# (pool-<run_id>-<attempt>-<n>) rather than inferred from age.
+reap_runners() {
+  local consumer="${GITHUB_REPOSITORY:-}" tok id name run_id out
+  [[ -n "$consumer" ]] || {
+    echo "no GITHUB_REPOSITORY — skipping orphaned-runner reap"
+    return 0
+  }
+  tok=$(pool_token "$consumer") || {
+    echo "::warning::no POOL_PAT — skipping orphaned-runner reap"
+    fail=1
+    return 0
+  }
+
+  echo "== $consumer (orphaned runners)"
+  while IFS=$'\t' read -r id name; do
+    [[ "$name" =~ ^pool-([0-9]+)-[0-9]+-[0-9]+$ ]] || continue
+    run_id="${BASH_REMATCH[1]}"
+
+    out=$(api "$tok" GET "/repos/$consumer/actions/runs/$run_id" 2>/dev/null) || {
+      # A deleted run is an orphan; anything else is a transient error,
+      # and deleting a runner whose run is still live would strand it.
+      [[ "$(jq -r '.message // ""' <<<"$out" 2>/dev/null)" == "Not Found" ]] || continue
+      out='{"status": "completed"}'
+    }
+    [[ "$(jq -r '.status // ""' <<<"$out")" == "completed" ]] || continue
+
+    if api "$tok" DELETE "/repos/$consumer/actions/runners/$id" >/dev/null; then
+      echo "$consumer: reaped orphaned runner $name (run $run_id is over)"
+    else
+      echo "::warning::$consumer: could not delete orphaned runner $name"
+      fail=1
+    fi
+  done < <(api "$tok" GET "/repos/$consumer/actions/runners?per_page=100" 2>/dev/null |
+    jq -r '.runners[]?
+           | select(.status == "offline")
+           | select(.busy != true)
+           | [.id, .name] | @tsv' 2>/dev/null || true)
+}
+
+reap_runners
 
 exit "$fail"
