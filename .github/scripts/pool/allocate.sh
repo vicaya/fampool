@@ -74,6 +74,11 @@ UPSTREAM_SHA=$(api "$CONSUMER_TOK" GET "/repos/$CONSUMER/contents/$HOST_WF" 2>/d
 # product=Actions + sku=actions_linux deliberately restricts the result
 # to the standard Linux meter: private repos on standard hosted Linux
 # runners are the minutes this pool is about.
+# 2000 is the smallest allowance GitHub grants (Free), so an account
+# whose plan nobody wrote down is assumed to be on it — an underestimate
+# never claims minutes an account does not have.
+DEFAULT_INCLUDED=2000
+
 BILLING_API_VERSION="${POOL_BILLING_API_VERSION:-2026-03-10}"
 BILLING_YEAR="${POOL_BILLING_YEAR:-$(date -u +%Y)}"
 BILLING_MONTH="${POOL_BILLING_MONTH:-$((10#$(date -u +%m)))}"
@@ -101,8 +106,8 @@ used_minutes() {
 }
 
 # remaining <token> <owner> <user|org> <included-minutes> — remaining
-# included minutes, or -1 (unknown) when the allowance is not configured
-# or the usage endpoint is unreadable.
+# included minutes, or -1 (unknown) when the usage endpoint is
+# unreadable.
 remaining() {
   local included="$4" used
   [[ "$included" =~ ^[0-9]+$ ]] || {
@@ -131,23 +136,25 @@ blob_sha() { # <token> <owner/repo> — sha of host-runner.yml, or "absent"
 # with two exceptions that decide the cases raw minutes get wrong:
 #
 #   -1  unknown — sorts below every account with a readable number, so a
-#       donor whose allowance nobody configured is a last resort rather
-#       than a first pick.
+#       donor whose billing the token cannot read is a last resort
+#       rather than a first pick.
 #   -2  home below the reserve floor — sorts below even unknown, because
 #       a home account that is nearly out is the whole reason the pool
 #       exists: an unknown donor is worth trying, home is not.
 #
-# Entries are "<rank>\t<slug>\t<remaining>"; the home entry simply means
-# "use ubuntu-latest", so when home leads, the pool stands down.
+# Entries are "<rank>\t<slug>\t<remaining>\t<token-var>"; the home entry
+# simply means "use ubuntu-latest", so when home leads, the pool stands
+# down.
 declare -a ORDER=()
 while read -r d; do
   owner=$(jq -r .owner <<<"$d")
   repo=$(jq -r .repo <<<"$d")
   type=$(jq -r '.account_type // "org"' <<<"$d")
-  included=$(jq -r '.included_minutes // "unknown"' <<<"$d")
+  included=$(jq -r ".included_minutes // $DEFAULT_INCLUDED" <<<"$d")
+  token_var=$(jq -r '.token_var // "POOL_PAT"' <<<"$d")
   slug="$owner/$repo"
-  tok=$(pool_token "$slug" 2>/dev/null) || {
-    echo "::warning::no pool token for $slug — skipping"
+  tok=$(pool_token "$slug" "$token_var" 2>/dev/null) || {
+    echo "::warning::\$$token_var is empty — no token for $slug, skipping"
     continue
   }
   rem=$(remaining "$tok" "$owner" "$type" "$included")
@@ -155,15 +162,15 @@ while read -r d; do
     echo "$slug below the reserve floor ($rem < $RESERVE min) — skipping"
     continue
   fi
-  ORDER+=("$rem"$'\t'"$slug"$'\t'"$rem")
+  ORDER+=("$rem"$'\t'"$slug"$'\t'"$rem"$'\t'"$token_var")
 done < <(jq -c '.donors[]' "$CONFIG")
 
 HOME_TYPE=$(jq -r '.home_account_type // "org"' "$CONFIG")
-HOME_INCLUDED=$(jq -r '.home_included_minutes // "unknown"' "$CONFIG")
+HOME_INCLUDED=$(jq -r ".home_included_minutes // $DEFAULT_INCLUDED" "$CONFIG")
 HOME_REM=$(remaining "$CONSUMER_TOK" "$HOME_OWNER" "$HOME_TYPE" "$HOME_INCLUDED")
 HOME_RANK="$HOME_REM"
 ((HOME_REM >= 0 && HOME_REM < RESERVE)) && HOME_RANK=-2
-ORDER+=("$HOME_RANK"$'\t'"HOME"$'\t'"$HOME_REM")
+ORDER+=("$HOME_RANK"$'\t'"HOME"$'\t'"$HOME_REM"$'\t'"POOL_PAT")
 mapfile -t SORTED < <(printf '%s\n' "${ORDER[@]}" | sort -s -t$'\t' -k1,1nr)
 
 # Deregister runners carrying this run's label so an abandoned donor job
@@ -209,7 +216,7 @@ cancel_dispatched() { # <token> <owner/repo>
 DEADLINE=$((SECONDS + WAIT))
 
 for entry in "${SORTED[@]}"; do
-  IFS=$'\t' read -r _rank slug rem <<<"$entry"
+  IFS=$'\t' read -r _rank slug rem token_var <<<"$entry"
   if [[ "$slug" == "HOME" ]]; then
     # Home sorts last when it is below the floor, so reaching it there
     # means no donor worked out — saying it "leads" would be backwards.
@@ -223,7 +230,7 @@ for entry in "${SORTED[@]}"; do
     break
   fi
   echo "trying donor $slug (remaining: $rem min)"
-  tok=$(pool_token "$slug")
+  tok=$(pool_token "$slug" "$token_var")
 
   # Refuse a mirror whose host-runner.yml differs from this repo's: it
   # would serve runner code nobody here reviewed. The sync job heals it.

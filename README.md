@@ -33,7 +33,7 @@ consumer repo.
 
 | Path | Role |
 | --- | --- |
-| `.github/pool.json` | Donor list, reserve floor, runner wait timeout |
+| `.github/pool.json` | Donor list with allowances and tokens, reserve floor, wait budget |
 | `.github/scripts/pool/lib.sh` | API wrapper + credential seam |
 | `.github/scripts/pool/allocate.sh` | Picks a donor, mints JIT config, dispatches, waits |
 | `.github/scripts/pool/sync.sh` | Keeps mirrors identical and correctly enabled |
@@ -54,7 +54,8 @@ You need two accounts: a **home** account owning this repo, and one or more
 or mirror of the consumer — see [Terms of service](#terms-of-service) below,
 this is not incidental. Name it whatever you like.
 
-**2. Create a classic PAT** that can reach every participating account:
+**2. Create a token** that can reach every participating account. A
+**classic PAT** is the one-credential option:
 
 | Scope | Why |
 | --- | --- |
@@ -62,28 +63,30 @@ this is not incidental. Name it whatever you like.
 | `workflow` | dispatch and cancel `host-runner.yml` in mirrors |
 | `read:org` (org donors) / `user` (personal donors) | read the billing usage summary |
 
-**Classic, not fine-grained** — for a pool spanning more than one account.
-`POOL_PAT` is used as one credential for the consumer *and* every donor,
-while a fine-grained PAT is scoped to a single resource owner, so on a
-multi-owner pool it fails against every account but one. A fine-grained token
-works only when every participant lives under the same owner; it then needs
-Administration → read & write (JIT configs), Actions → read & write (dispatch
-and cancel), Contents → read & write (the mirror push), and the billing read
-for the account type — *Account Plan: read* for a user, *Organization
+**A fine-grained PAT cannot be that one credential across owners** — it is
+scoped to a single resource owner, so on a multi-owner pool it authenticates
+against one account and fails on the rest. Use one per owner instead and
+name each in `pool.json` (`token_var`, step 4); each needs Administration →
+read & write (JIT configs), Actions → read & write (dispatch and cancel),
+Contents → read & write (the mirror push), and the billing read for its
+account type — *Account Plan: read* for a user, *Organization
 Administration: read* for an org.
 
-The billing read is optional. Without it — or without `included_minutes` in
-the config below — an account ranks as *unknown*: the allocator still lends,
-it just cannot order donors by who has the most left. See
-[Ranking](#how-accounts-are-ranked).
+The billing read is optional. Without it an account ranks as *unknown*: the
+allocator still lends, it just cannot order donors by who has the most left.
+See [Ranking](#how-accounts-are-ranked).
 
-For pools that outgrow one credential, `pool_token` in `lib.sh` is the seam
-for per-owner tokens or a GitHub App installed on each account.
+For pools that outgrow a handful of tokens, `pool_token` in `lib.sh` is the
+seam for a GitHub App installed on each account.
 
 **3. Configure the home repo** — Settings → Secrets and variables → Actions:
 
 - secret `POOL_PAT` — the token from step 2
 - variable `POOL_HOME_OWNER` — the home account's login (e.g. `vicaya`)
+
+Using a token per owner? Add each as its own secret, then pass it through in
+`pool-allocate.yml` and `pool-sync.yml` — both have a commented `env:` line
+showing where. `secrets: inherit` alone does not reach the script.
 
 `POOL_HOME_OWNER` is the kill switch: every guarded workflow runs only where
 it is set, so mirrors — which never have it — stay inert instead of running
@@ -102,7 +105,8 @@ duplicate CI on the minutes you are trying to save.
       "owner": "some-org",
       "repo": "fampool",
       "account_type": "org",
-      "included_minutes": 3000
+      "included_minutes": 3000,
+      "token_var": "DONOR_ORG_PAT"
     }
   ]
 }
@@ -117,12 +121,19 @@ account.
 `included_minutes` is each account's monthly allowance — 2000 on Free, 3000
 on Pro and Team, [whatever your plan
 says](https://docs.github.com/en/billing/managing-billing-for-your-products/about-billing-for-github-actions).
-It has to be configured because GitHub's billing API reports *consumption*,
-not entitlement: the allocator reads minutes used from
-`/settings/billing/usage/summary` and subtracts. That is the same query
-`scripts/gam.sh --included` runs, so if `gam.sh` reports a number for an
-account, the allocator will too. Omit the field and that account ranks
-*unknown*.
+It is configuration rather than something read from the API because GitHub's
+billing endpoint reports *consumption*, not entitlement: the allocator reads
+minutes used from `/settings/billing/usage/summary` and subtracts. That is
+the same query `scripts/gam.sh --included` runs, so if `gam.sh` reports a
+number for an account, the allocator will too. **Default: 2000**, the Free
+tier — the smallest allowance GitHub grants, so an account whose plan nobody
+wrote down is never credited with minutes it does not have. Set it per donor
+and, for the home account, as `home_included_minutes`.
+
+`token_var` names the environment variable holding that donor's token,
+**default `POOL_PAT`**. Leave it out for a pool that runs on one classic PAT;
+set it when each owner has its own token, and add the matching `env:` line to
+the two workflows as step 3 describes.
 
 `runner_wait_seconds` is the budget for the **whole** allocation, shared
 across donors — not a per-donor timeout. Keep it comfortably under the
@@ -158,9 +169,9 @@ floor, ordered by remaining included minutes. Home is in that list like any
 other account, and when it wins the pool simply stands down. Two cases do not
 follow from raw minutes:
 
-- **Unknown sorts below any readable number.** A donor whose allowance is
-  unconfigured, or whose billing the token cannot read, is a last resort
-  rather than a first pick.
+- **Unknown sorts below any readable number.** An account whose billing the
+  token cannot read is a last resort rather than a first pick. (An allowance
+  merely left out of the config is not unknown — it defaults to 2000.)
 - **Except against a home account below the floor**, which sorts below even
   unknown. A repo that is nearly out of minutes is the entire reason this
   exists; an unknown donor is worth trying there, and home is not.
@@ -207,11 +218,13 @@ ok    runner never comes online                      "ubuntu-latest"
 ok    donor leads, runner is borrowed                ["pool-run-12345-1"]
 ok    unreadable billing still lends                 ["pool-run-12345-1"]
 ok    unknown donor beats an exhausted home          ["pool-run-12345-1"]
-ok    donor with no configured allowance still lends ["pool-run-12345-1"]
+ok    unconfigured allowance defaults to 2000        "ubuntu-latest"
+ok    donor lends through its own token_var          ["pool-run-12345-1"]
+ok    donor whose token_var is unset is skipped      "ubuntu-latest"
 ok    three dead donors share one wait budget        "ubuntu-latest"
 ok    abandoned dispatch is cancelled                "ubuntu-latest"
 
-15 passed, 0 failed
+17 passed, 0 failed
 ```
 
 No network, no credentials, no repo. Add a case by setting `STUB_*`

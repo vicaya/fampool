@@ -28,10 +28,11 @@ fail=0
 while read -r d; do
   owner=$(jq -r .owner <<<"$d")
   repo=$(jq -r .repo <<<"$d")
+  token_var=$(jq -r '.token_var // "POOL_PAT"' <<<"$d")
   slug="$owner/$repo"
 
-  tok=$(pool_token "$slug") || {
-    echo "::warning::no pool token for $slug — skipping"
+  tok=$(pool_token "$slug" "$token_var") || {
+    echo "::warning::\$$token_var is empty — no token for $slug, skipping"
     fail=1
     continue
   }

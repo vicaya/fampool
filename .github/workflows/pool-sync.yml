@@ -32,4 +32,9 @@ jobs:
           persist-credentials: false
       - env:
           POOL_PAT: ${{ secrets.POOL_PAT }}
+          # Per-donor credentials: add one line here for every
+          # `token_var` named in pool.json. A fine-grained PAT is scoped
+          # to a single resource owner, so a pool spanning several owners
+          # needs one token per owner rather than one POOL_PAT for all.
+          #   DONOR_ORG_PAT: ${{ secrets.DONOR_ORG_PAT }}
         run: .github/scripts/pool/sync.sh

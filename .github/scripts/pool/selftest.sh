@@ -25,7 +25,11 @@ INCLUDED=2000 # the allowance every stubbed account is configured with
 # time by allocate.sh, not now.
 cat >"$TMP/stub-lib.sh" <<'STUB'
 have_pool_creds() { [[ -n "${POOL_PAT:-}" ]]; }
-pool_token() { [[ -n "${POOL_PAT:-}" ]] || return 1; printf 'stub-token'; }
+pool_token() { # <owner/repo> [token-env-var]
+  local var="${2:-POOL_PAT}"
+  [[ -n "${!var:-}" ]] || return 1
+  printf 'stub-token-%s' "$var"
+}
 
 _usage() { # <remaining-minutes|unknown> — a billing usage-summary payload
   if [[ "$1" == unknown ]]; then
@@ -51,6 +55,7 @@ api() { # <token> <method> <path> [body] [api-version]
       jq -nc '{encoded_jit_config: "JIT-CONFIG-BLOB"}'
       ;;
     */actions/workflows/*/dispatches)
+      echo "$1" >>"$STUB_TOKEN_LOG"
       echo '{}'
       ;;
     */actions/workflows/*/runs*)
@@ -82,13 +87,11 @@ api() { # <token> <method> <path> [body] [api-version]
 }
 STUB
 
-donor_json() { # <owner> [included_minutes] — one donor entry
-  if [[ -n "${2:-}" ]]; then
-    jq -nc --arg o "$1" --argjson i "$2" \
-      '{owner: $o, repo: "fampool", account_type: "org", included_minutes: $i}'
-  else
-    jq -nc --arg o "$1" '{owner: $o, repo: "fampool", account_type: "org"}'
-  fi
+donor_json() { # <owner> [included_minutes] [token_var] — one donor entry
+  jq -nc --arg o "$1" --arg i "${2:-}" --arg t "${3:-}" \
+    '{owner: $o, repo: "fampool", account_type: "org"}
+     + (if $i == "" then {} else {included_minutes: ($i | tonumber)} end)
+     + (if $t == "" then {} else {token_var: $t} end)'
 }
 
 write_config() { # <runner_wait_seconds> <donors-json-array>
@@ -106,7 +109,11 @@ defaults() {
   export STUB_CONSUMER_SHA=abc123 STUB_DONOR_SHA=abc123
   export STUB_DONOR_MIN=1500 STUB_HOME_MIN=100 STUB_ONLINE=1
   export STUB_INCLUDED="$INCLUDED" STUB_CANCEL_LOG="$TMP/cancelled"
+  export STUB_TOKEN_LOG="$TMP/tokens"
   : >"$STUB_CANCEL_LOG"
+  : >"$STUB_TOKEN_LOG"
+  # Case-local credentials must not leak into the next case.
+  unset DONOR_ACCT_PAT MISSING_PAT
   write_config 240 "[$(donor_json donor-acct "$INCLUDED")]"
 }
 
@@ -162,6 +169,18 @@ check_within() { # <case name> <expected runs_on> <max seconds>
   if [[ -z "$problem" ]] && ((ELAPSED > $3)); then
     problem=$(printf '      took %ds; the whole allocation must fit in %ds\n' \
       "$ELAPSED" "$3")
+  fi
+  report "$1" "$problem"
+}
+
+check_dispatch_token() { # <case name> <expected runs_on> <expected token>
+  run
+  local problem seen
+  problem="$(verdict "$2")"
+  seen=$(sort -u "$STUB_TOKEN_LOG" | paste -sd, -)
+  if [[ -z "$problem" && "$seen" != "$3" ]]; then
+    problem=$(printf '      dispatched with token %s, expected %s\n' \
+      "${seen:-<none>}" "$3")
   fi
   report "$1" "$problem"
 }
@@ -239,12 +258,29 @@ defaults
 export STUB_DONOR_MIN=unknown STUB_HOME_MIN=100
 check "unknown donor beats an exhausted home" "$POOLED"
 
-# Same, with the allowance simply left out of pool.json rather than the
-# endpoint failing: both read as unknown and neither may strand a job.
+# --- defaults -----------------------------------------------------------
+# An allowance left out of pool.json is assumed to be the Free tier's
+# 2000, not unknown: this donor has 1900 of those spent, which puts it
+# under the floor. Ranked unknown instead it would sort above a home
+# account this low and lend.
 defaults
 write_config 240 "[$(donor_json donor-acct)]"
-export STUB_HOME_MIN=100
-check "donor with no configured allowance still lends" "$POOLED"
+export STUB_DONOR_MIN=100 STUB_HOME_MIN=100
+check "unconfigured allowance defaults to 2000" "$HOME_RUNNER"
+
+# --- per-donor credentials ----------------------------------------------
+# One POOL_PAT cannot authenticate against several owners when the tokens
+# are fine-grained, so a donor may name its own secret.
+defaults
+write_config 240 "[$(donor_json donor-acct "$INCLUDED" DONOR_ACCT_PAT)]"
+export DONOR_ACCT_PAT=stub
+check_dispatch_token "donor lends through its own token_var" "$POOLED" \
+  stub-token-DONOR_ACCT_PAT
+
+defaults
+write_config 240 "[$(donor_json donor-acct "$INCLUDED" MISSING_PAT)]"
+unset MISSING_PAT
+check "donor whose token_var is unset is skipped" "$HOME_RUNNER"
 
 # --- budgets and cleanup ------------------------------------------------
 # runner_wait_seconds is the budget for the whole allocation, not per

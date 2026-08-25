@@ -32,10 +32,20 @@ have_pool_creds() {
   [[ -n "${POOL_PAT:-}" ]]
 }
 
-# pool_token <owner/repo> — a token that can reach the given repository.
-# The argument is unused with a PAT (one token reaches everything); it is
-# the seam an App-based deployment mints a per-installation token from.
+# pool_token <owner/repo> [token-env-var] — a token that can reach the
+# given repository, read from the named environment variable (default
+# POOL_PAT).
+#
+# One POOL_PAT for everything is the simple case. Naming a variable per
+# donor — `token_var` in pool.json — is what a pool spanning several
+# owners needs, since a fine-grained PAT is scoped to a single resource
+# owner and cannot authenticate against the rest. The workflows have to
+# pass each named secret through as env; see pool-allocate.yml.
+#
+# The slug argument is unused with PATs; it is the seam an App-based
+# deployment mints a per-installation token from.
 pool_token() {
-  [[ -n "${POOL_PAT:-}" ]] || return 1
-  printf '%s' "$POOL_PAT"
+  local var="${2:-POOL_PAT}"
+  [[ -n "${!var:-}" ]] || return 1
+  printf '%s' "${!var}"
 }
