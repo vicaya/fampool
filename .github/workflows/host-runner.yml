@@ -1,0 +1,80 @@
+name: host-runner
+
+# Donor entry point. The allocator in the consumer repo dispatches this
+# with a single-use JIT runner config; this job rents a GitHub-hosted
+# runner on the donor's minutes, points the runner agent at the consumer
+# repo, serves exactly one job, and exits.
+#
+# It ships with the project so every synced mirror carries an identical
+# copy — the allocator refuses to dispatch a mirror whose copy differs.
+# In the home repo it is inert: it only runs when dispatched, and the
+# allocator never dispatches at home.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jit_config:
+        description: Single-use JIT runner config minted by the pool allocator
+        required: true
+        type: string
+      pool_label:
+        description: Allocation label — lets the allocator find and cancel this run
+        required: false
+        default: ""
+        type: string
+
+# The run name carries the allocation label so the allocator can cancel a
+# dispatch that is still queued when it gives up on this donor. A queued
+# run has registered no runner yet, so deregistering by label cannot
+# reach it, and left alone it would come online to serve a job that is
+# no longer coming and idle out the timeout below on the donor's dime.
+run-name: host-runner ${{ inputs.pool_label }}
+
+permissions: {}
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    # Total cap on donor minutes this job can burn. A JIT runner exits on
+    # its own once it has served its single job; this bound is what stops
+    # a runner nobody ever sends work to from idling for the full 6h
+    # hosted-job limit. Keep pooled consumer jobs comfortably under it.
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the runner agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Authenticated even though the release metadata is public: the
+        # unauthenticated limit is 60/hour per egress IP, shared across
+        # every job on that runner's IP. A zero-scope GITHUB_TOKEN is
+        # enough to authenticate and needs no permissions, which is why
+        # `permissions: {}` above still works.
+        #
+        # --fail on both calls because the failure is otherwise silent:
+        # a rate-limited response has no .tag_name, jq prints "null", and
+        # curl -o happily writes a 404 body into the tarball, so the
+        # first thing that errors is tar — after the donor has already
+        # spent minutes and the consumer is waiting out its deadline.
+        run: |
+          set -o pipefail
+          ver=$(curl -sSL --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/actions/runner/releases/latest |
+            jq -er .tag_name)
+          ver="${ver#v}"
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            { echo "unexpected runner version: $ver" >&2; exit 1; }
+          echo "actions/runner v$ver"
+          curl -sSL --fail -o runner.tar.gz \
+            "https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz"
+          mkdir -p runner
+          tar xzf runner.tar.gz -C runner
+
+      - name: Serve one job for the consumer repo
+        env:
+          JIT_CONFIG: ${{ inputs.jit_config }}
+        working-directory: runner
+        # --jitconfig registers, runs a single job, deregisters, exits.
+        # No token is persisted and no runner record survives the job.
+        run: ./run.sh --jitconfig "$JIT_CONFIG"

@@ -1,0 +1,66 @@
+name: pool-allocate
+
+# Reusable allocator. Call it as a job, then point downstream jobs at
+# its output:
+#
+#   allocate:
+#     if: github.repository_owner == vars.POOL_HOME_OWNER
+#     uses: ./.github/workflows/pool-allocate.yml
+#     with:
+#       count: 1          # runners = number of parallel pooled jobs
+#     secrets: inherit    # required — passes POOL_PAT through
+#   my-job:
+#     needs: allocate
+#     runs-on: ${{ fromJSON(needs.allocate.outputs.runs_on) }}
+#
+# Emits either a pooled-runner label array or "ubuntu-latest". Callers
+# never fail because the pool is empty; they just run at home.
+
+on:
+  workflow_call:
+    inputs:
+      count:
+        description: Number of pooled runners to provision (one per parallel job)
+        type: number
+        required: false
+        default: 1
+    outputs:
+      runs_on:
+        description: JSON for runs-on — a pooled label array or "ubuntu-latest"
+        value: ${{ jobs.allocate.outputs.runs_on }}
+
+permissions:
+  contents: read
+
+jobs:
+  allocate:
+    # This job is the control plane and it runs on the home account's own
+    # minutes — roughly one per call. A home account past a hard cutoff
+    # (included minutes gone, overages blocked) cannot start it, and a
+    # pool whose allocator cannot run lends nothing; see README §Limits.
+    runs-on: ubuntu-latest
+    # Must stay above pool.json's dispatch_confirm_seconds, which the
+    # allocator spends as one budget for the whole attempt. Killed here
+    # instead, no runs_on output exists and every `needs: allocate` job
+    # is skipped rather than falling back to home runners — so the script
+    # clamps that window to 240s rather than trusting config to respect
+    # this number (POOL_CONFIRM_MAX; raise both together). Five minutes
+    # is far more than confirming a dispatch can honestly need, so a hang
+    # shows up as a failure rather than as ten more billed minutes.
+    timeout-minutes: 5
+    outputs:
+      runs_on: ${{ steps.pick.outputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: pick
+        env:
+          COUNT: ${{ inputs.count }}
+          POOL_PAT: ${{ secrets.POOL_PAT }}
+          # Per-donor credentials: add one line here for every
+          # `token_var` named in pool.json. A fine-grained PAT is scoped
+          # to a single resource owner, so a pool spanning several owners
+          # needs one token per owner rather than one POOL_PAT for all.
+          #   DONOR_ORG_PAT: ${{ secrets.DONOR_ORG_PAT }}
+        run: .github/scripts/pool/allocate.sh

@@ -1,0 +1,57 @@
+name: demo
+
+# The whole point of the repo: a job that borrows a runner from the pool
+# and then tells you where it actually ran. Trigger it from the Actions
+# tab (Run workflow) or push to main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  allocate:
+    if: github.repository_owner == vars.POOL_HOME_OWNER
+    uses: ./.github/workflows/pool-allocate.yml
+    with:
+      count: 1
+    secrets: inherit
+
+  where-did-i-run:
+    needs: allocate
+    runs-on: ${{ fromJSON(needs.allocate.outputs.runs_on) }}
+    # Must stay under host-runner.yml's own timeout-minutes, or a pooled
+    # run would be cut off by the donor side mid-job.
+    timeout-minutes: 10
+    steps:
+      - name: Report the runner that served this job
+        run: |
+          # Pooled runners are the ones the allocator named; anything else
+          # is a GitHub-hosted runner on the home account's minutes.
+          if [[ "$RUNNER_NAME" == pool-* ]]; then
+            verdict="POOLED — served by a donor account's minutes"
+          else
+            verdict="HOME — served by ${GITHUB_REPOSITORY%%/*}'s own minutes"
+          fi
+          {
+            echo "## Demo job"
+            echo
+            echo "**$verdict**"
+            echo
+            echo '```'
+            echo "runner name : $RUNNER_NAME"
+            echo "runner os   : $RUNNER_OS / $(uname -srm)"
+            echo "labels      : ${{ toJSON(needs.allocate.outputs.runs_on) }}"
+            echo "repository  : $GITHUB_REPOSITORY"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "$verdict (runner: $RUNNER_NAME)"
+
+      - name: Do some actual work
+        run: |
+          echo "Pretending to build and test..."
+          nproc && free -m | head -2
