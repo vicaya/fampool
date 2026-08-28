@@ -37,6 +37,12 @@ api() { # <token> <method> <path> [body]
   echo "$method $path${body:+ $body}" >>"$STUB_LOG"
 
   case "$method $path" in
+    "GET /repos/$STUB_DONOR/commits"*)
+      # An empty repo has no commits; the endpoint errors, and that is
+      # how sync.sh recognizes an interrupted bootstrap.
+      [[ "$STUB_DONOR_EMPTY" == 1 ]] && return 22
+      jq -nc '[{sha: "abc123"}]'
+      ;;
     "GET /repos/$STUB_DONOR")
       # A queued fork becomes visible after STUB_FORK_DELAY polls; that
       # is the only reason sync.sh polls this at all.
@@ -114,7 +120,7 @@ defaults() {
   export POOL_POLL_SECONDS=0 POOL_BOOTSTRAP_WAIT=60
   export GITHUB_REPOSITORY="$CONSUMER"
   export STUB_DONOR="donor-acct/fampool" STUB_LOGIN=donor-acct
-  export STUB_DONOR_EXISTS=0 STUB_FORK_DELAY=0
+  export STUB_DONOR_EXISTS=0 STUB_DONOR_EMPTY=0 STUB_FORK_DELAY=0
   export STUB_FORK_FAILS=0 STUB_CREATE_FAILS=0 STUB_PUSH_FAILS=0
   export STUB_LOG="$TMP/calls" STUB_STATE="$TMP/state"
   rm -rf "$STUB_STATE"
@@ -183,7 +189,14 @@ report() { # <case name>
 
 PUSH="GIT push HEAD:refs/heads/main"
 
-# --- steady state: an existing mirror must not be touched by bootstrap --
+ENABLE_ON='/actions/permissions {"enabled":true}'
+ENABLE_OFF='/actions/permissions {"enabled":false}'
+
+# --- steady state: no bootstrap, but repo-wide Actions is re-asserted ---
+# The assert is what heals a mirror whose bootstrap re-enable was lost
+# to a transient failure, or whose owner toggled Actions off by hand —
+# states in which the per-workflow enable would "succeed" while every
+# dispatch is refused.
 defaults
 export STUB_DONOR_EXISTS=1
 run_sync
@@ -191,8 +204,9 @@ want_rc 0
 want "$PUSH"
 want_not "/forks"
 want_not "POST /orgs/"
-want_not "/actions/permissions"
-report "existing mirror is left alone"
+want_not "$ENABLE_OFF"
+want_before "$PUSH" "$ENABLE_ON"
+report "existing mirror re-asserts Actions, no bootstrap"
 
 # --- opt-in: a missing repo is not created behind your back -------------
 defaults
@@ -216,8 +230,10 @@ want "POST /repos/$CONSUMER/forks"
 want "\"name\":\"fampool\""
 want "\"default_branch_only\":true"
 want_before "/forks" "$PUSH"
-# A fork starts with every workflow off, so there is nothing to bracket.
-want_not "/actions/permissions"
+# A fork starts with every workflow off, so there is nothing to bracket
+# — only the steady-state re-assert appears.
+want_not "$ENABLE_OFF"
+want "$ENABLE_ON"
 report "org donor on POOL_PAT is forked, then pushed"
 
 defaults
@@ -243,8 +259,8 @@ want "POST /orgs/donor-acct/repos"
 want "\"private\":true"
 # A fresh repo starts with Actions ON, so the first push has to happen
 # with the repo-wide switch off or test.yml runs on donor minutes.
-want_before "/actions/permissions {\"enabled\":false}" "$PUSH"
-want_before "$PUSH" "/actions/permissions {\"enabled\":true}"
+want_before "$ENABLE_OFF" "$PUSH"
+want_before "$PUSH" "$ENABLE_ON"
 report "org donor on a fine-grained token is created, push bracketed"
 
 defaults
@@ -268,17 +284,42 @@ want_not "$PUSH"
 report "personal donor whose token is another account is refused"
 
 # --- failure handling ---------------------------------------------------
-# Actions must not be left off on a repo that failed its first push: the
-# mirror could never host a runner, and bootstrap will not run again now
-# that the repo exists.
+# A failed first push leaves Actions OFF on purpose. The repo is still
+# empty, so the next sync re-brackets the retry — re-enabling here is
+# what would let that retry fire test.yml on donor minutes.
 defaults
 write_config "$(donor_json donor-acct org DONOR_PAT true)"
 export DONOR_PAT=stub STUB_PUSH_FAILS=1
 run_sync
 want_rc 1
 want_log "push failed"
-want "/actions/permissions {\"enabled\":true}"
-report "failed first push still re-enables Actions"
+want "$ENABLE_OFF"
+want_not "$ENABLE_ON"
+report "failed first push leaves Actions off for the retry"
+
+# The second half of that story: the repo now exists but is empty, and
+# the retry must be bracketed exactly like the first attempt.
+defaults
+write_config "$(donor_json donor-acct org DONOR_PAT true)"
+export DONOR_PAT=stub STUB_DONOR_EXISTS=1 STUB_DONOR_EMPTY=1
+run_sync
+want_rc 0
+want_not "POST /orgs/"
+want_not "/forks"
+want_before "$ENABLE_OFF" "$PUSH"
+want_before "$PUSH" "$ENABLE_ON"
+report "interrupted bootstrap is re-bracketed on retry"
+
+# Without the opt-in, an empty repo is just a mirror someone made by
+# hand: plain push, no admin-level bracket its token may not have.
+defaults
+write_config "$(donor_json donor-acct org DONOR_PAT false)"
+export DONOR_PAT=stub STUB_DONOR_EXISTS=1 STUB_DONOR_EMPTY=1
+run_sync
+want_rc 0
+want "$PUSH"
+want_not "$ENABLE_OFF"
+report "empty mirror without bootstrap gets no bracket"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

@@ -217,17 +217,24 @@ sync does — the donor's token never needs to read the consumer. One wrinkle
 is handled for you: unlike a fork, a repo created from scratch has Actions
 **enabled**, so its first push would run `test.yml` and any other
 push-triggered workflow on the donor's minutes. `pool-sync` switches Actions
-off around that one push (a push with Actions off queues nothing) and back on
-after, leaving the per-workflow pass to take it from there.
+off before that push (a push with Actions off queues nothing) and the
+per-workflow pass takes it from there. The bracket survives interruption:
+if the first push fails, Actions deliberately stays off, and the next sync
+recognizes the still-empty repo as an unfinished bootstrap and brackets the
+retry the same way. And the *on* side is not bootstrap's alone — every sync
+re-asserts repo-wide Actions for every donor after its push, which is also
+what heals a mirror whose switch was flipped off by hand or lost to a
+transient failure, states in which the mirror silently stops hosting while
+everything else still looks healthy.
 
 For a personal-account donor, `POST /user/repos` creates under whatever
 account the token belongs to, ignoring the `owner` in your config — so
 `pool-sync` checks the token's login against `owner` first and refuses on a
 mismatch rather than putting the mirror somewhere else.
 
-Bootstrap only ever runs on a 404, so re-running a sync never re-creates
-anything, and it only creates: renaming and deleting donor repos stay
-yours.
+Bootstrap only ever creates on a 404 (and re-brackets only an empty,
+opted-in repo), so re-running a sync never re-creates anything — and it
+only creates: renaming and deleting donor repos stay yours.
 
 ## What the allocator waits for
 
@@ -330,16 +337,18 @@ alongside the stubbed API so a case can assert that Actions was switched off
 
 ```console
 $ .github/scripts/pool/selftest-sync.sh
-ok    existing mirror is left alone
+ok    existing mirror re-asserts Actions, no bootstrap
 ok    missing repo without bootstrap warns and fails
 ok    org donor on POOL_PAT is forked, then pushed
 ok    fork that never appears is reported, not pushed
 ok    org donor on a fine-grained token is created, push bracketed
 ok    personal donor is created under the matching account
 ok    personal donor whose token is another account is refused
-ok    failed first push still re-enables Actions
+ok    failed first push leaves Actions off for the retry
+ok    interrupted bootstrap is re-bracketed on retry
+ok    empty mirror without bootstrap gets no bracket
 
-8 passed, 0 failed
+10 passed, 0 failed
 ```
 
 No network, no credentials, no repo. Add a case by setting `STUB_*`

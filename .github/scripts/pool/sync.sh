@@ -60,14 +60,30 @@ actions_enabled() {
 # repositories" plus Administration: write, since a repo that does not
 # exist yet cannot be in a selected-repositories list).
 #
-# Everything here is gated on the repo being absent, so re-running a
-# sync never re-bootstraps.
+# Everything here is gated on the repo being absent or still empty, so
+# re-running a sync never re-creates anything.
 bootstrap_donor() {
   local tok="$1" slug="$2" type="$3" var="$4" want="$5"
   local owner="${slug%%/*}" name="${slug#*/}" out login path deadline
   BOOTSTRAP=""
 
-  out=$(api "$tok" GET "/repos/$slug" 2>/dev/null) && return 0
+  out=$(api "$tok" GET "/repos/$slug" 2>/dev/null) && {
+    # Existing does not mean bootstrapped: a create whose first push
+    # failed leaves an empty repo, and the retry is still a
+    # first-content push into a repo whose Actions are on — unbracketed
+    # it would fire test.yml on the donor's minutes. An empty repo has
+    # no commits (the endpoint errors), so that is the test. Gated on
+    # the donor's opt-in: an empty mirror made by hand, bootstrap off,
+    # stays on the plain path its narrower token may require. A
+    # transient error here merely brackets a push that needed no
+    # bracket, which is harmless.
+    if [[ "$want" == true ]] &&
+      ! api "$tok" GET "/repos/$slug/commits?per_page=1" >/dev/null 2>&1; then
+      echo "$slug: repo exists but is empty — finishing an interrupted bootstrap"
+      BOOTSTRAP=create
+    fi
+    return 0
+  }
   # A repo that exists but is invisible to this token also answers 404,
   # in which case the create below fails on the name and says so.
   if [[ "$(jq -r '.message // ""' <<<"$out" 2>/dev/null)" != "Not Found" ]]; then
@@ -149,12 +165,14 @@ while read -r d; do
   }
 
   # A repo created from scratch starts with Actions *enabled*, unlike a
-  # fork. Its first push would therefore run test.yml — deliberately not
-  # owner-guarded — and every other push-triggered workflow, on the
-  # donor's minutes. A push made while Actions is off queues no runs, so
-  # the repo-wide switch brackets that one push and the per-workflow
-  # pass below takes over from there. Bootstrap-only: on every later
-  # sync the repo exists and the workflows are already disabled.
+  # fork. Its first-content push would therefore run test.yml —
+  # deliberately not owner-guarded — and every other push-triggered
+  # workflow, on the donor's minutes. A push made while Actions is off
+  # queues no runs, so the repo-wide switch is turned off across that
+  # one push; the unconditional re-enable after the push and the
+  # per-workflow pass take over from there. (This disable failing has a
+  # milder shape — one unbracketed push, self-limiting — hence the hard
+  # stop and nothing more.)
   if [[ "$BOOTSTRAP" == create ]]; then
     actions_enabled "$tok" "$slug" false || {
       fail=1
@@ -162,25 +180,27 @@ while read -r d; do
     }
   fi
 
-  push_ok=true
-  git push --force "https://x-access-token:$tok@github.com/$slug" "HEAD:refs/heads/main" ||
-    push_ok=false
-
-  if [[ "$BOOTSTRAP" == create ]]; then
-    # Re-enable even after a failed push: left off, the mirror can never
-    # host a runner, and bootstrap will not run again now that the repo
-    # exists.
-    actions_enabled "$tok" "$slug" true || {
-      fail=1
-      continue
-    }
-  fi
-
-  if ! $push_ok; then
+  if ! git push --force "https://x-access-token:$tok@github.com/$slug" "HEAD:refs/heads/main"; then
+    # On a bracketed repo Actions deliberately stays off here: the repo
+    # is still empty, so the next sync re-detects the interrupted
+    # bootstrap and brackets the retry — re-enabling now is exactly what
+    # would let that retry fire workflows unbracketed.
     echo "::warning::$slug: push failed"
     fail=1
     continue
   fi
+
+  # Repo-wide Actions is asserted on every sync for every donor, not
+  # only after a bootstrap. This is both the bracket's re-enable and the
+  # healing for the states nothing else detects — a re-enable lost to a
+  # transient failure, or a human toggling the switch off in the
+  # mirror's settings — in which the per-workflow enable below would
+  # "succeed" while the allocator's dispatches are refused and sync
+  # keeps reporting a healthy pool.
+  actions_enabled "$tok" "$slug" true || {
+    fail=1
+    continue
+  }
 
   wfs=$(api "$tok" GET "/repos/$slug/actions/workflows?per_page=100") || {
     echo "::warning::$slug: cannot list workflows"
