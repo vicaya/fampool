@@ -25,6 +25,8 @@ jobs:
         run: shellcheck .github/scripts/pool/*.sh scripts/*.sh
       - name: allocator suite (offline)
         run: .github/scripts/pool/selftest.sh
+      - name: sync suite (offline)
+        run: .github/scripts/pool/selftest-sync.sh
       - name: workflows parse
         run: |
           for f in .github/workflows/*.yml; do

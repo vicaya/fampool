@@ -36,8 +36,9 @@ consumer repo.
 | `.github/pool.json` | Donor list with allowances and tokens, reserve floor, confirm budget |
 | `.github/scripts/pool/lib.sh` | API wrapper + credential seam |
 | `.github/scripts/pool/allocate.sh` | Picks a donor, mints JIT config, dispatches, confirms |
-| `.github/scripts/pool/sync.sh` | Keeps mirrors identical and enabled; reaps dead runner records |
+| `.github/scripts/pool/sync.sh` | Creates missing mirrors, keeps them identical and enabled, reaps dead runner records |
 | `.github/scripts/pool/selftest.sh` | Offline tests for every allocator decision |
+| `.github/scripts/pool/selftest-sync.sh` | Offline tests for donor bootstrap |
 | `.github/workflows/pool-allocate.yml` | Reusable allocator job |
 | `.github/workflows/host-runner.yml` | Donor side — hosts one runner, one job |
 | `.github/workflows/pool-sync.yml` | Daily mirror sync |
@@ -53,6 +54,12 @@ You need two accounts: a **home** account owning this repo, and one or more
 **1. Fork this repo into each donor account.** The donor's copy must be a fork
 or mirror of the consumer — see [Terms of service](#terms-of-service) below,
 this is not incidental. Name it whatever you like.
+
+Or let `pool-sync` do it: a donor marked `"bootstrap": true` (step 4) whose
+repo does not exist yet is created on the first sync — forked where the
+credential allows, otherwise created empty and populated by the sync push.
+Forking by hand is the path that needs no extra token permissions, so it
+stays the default; `bootstrap` is opt-in per donor.
 
 **2. Create a token** that can reach every participating account. A
 **classic PAT** is the one-credential option:
@@ -71,6 +78,14 @@ read & write (JIT configs), Actions → read & write (dispatch and cancel),
 Contents → read & write (the mirror push), and the billing read for its
 account type — *Account Plan: read* for a user, *Organization
 Administration: read* for an org.
+
+**Bootstrap widens that grant, so only enable it where you want it.** The
+classic PAT needs nothing new — `repo` already covers both forking and
+creating. A fine-grained token needs **"All repositories"** for its owner,
+because a repo that does not exist yet cannot be in a selected-repositories
+list, plus Administration: write. That is wider than the running pool ever
+needs, which is why `bootstrap` defaults to off: turn it on to create the
+mirror, and you can narrow the token again afterwards.
 
 The billing read is optional. Without it an account ranks as *unknown*: the
 allocator still lends, it just cannot order donors by who has the most left.
@@ -106,7 +121,8 @@ duplicate CI on the minutes you are trying to save.
       "repo": "fampool",
       "account_type": "org",
       "included_minutes": 3000,
-      "token_var": "DONOR_ORG_PAT"
+      "token_var": "DONOR_ORG_PAT",
+      "bootstrap": false
     }
   ]
 }
@@ -137,6 +153,13 @@ and, for the home account, as `home_included_minutes`.
 **default `POOL_PAT`**. Leave it out for a pool that runs on one classic PAT;
 set it when each owner has its own token, and add the matching `env:` line to
 the two workflows as step 3 describes.
+
+`bootstrap` (**default `false`**) lets `pool-sync` create this donor's repo
+when it does not exist. Left off, a missing repo is reported as one —
+`donor repo missing; set "bootstrap": true to auto-create` — rather than
+failing opaquely at the push. See
+[Creating mirrors](#creating-mirrors-automatically) for which path each
+credential can take.
 
 `dispatch_confirm_seconds` is how long the allocator will wait for proof
 that a donor accepted the dispatch and created a run — a budget for the
@@ -171,6 +194,47 @@ If no donor qualifies you get the fallback instead, with the reason spelled
 out — `home account leads the pool`, `below the reserve floor`, `drifted or
 absent`, and so on. **This is the design working, not a failure.** Every
 shortfall degrades to `ubuntu-latest`; nothing in the pool can break your CI.
+
+## Creating mirrors automatically
+
+`pool-sync` bootstraps a donor marked `"bootstrap": true` whose repo answers
+404, then pushes as usual. Which of the two paths it takes is decided by the
+credential, not by preference:
+
+| Donor | Path | Why |
+| --- | --- | --- |
+| Org, on the classic `POOL_PAT` | **fork** | One token can read the private consumer *and* create in the donor account |
+| Anything on a per-owner `token_var` | **create + push** | A fine-grained token cannot see the consumer repo, so it cannot fork |
+| Personal account | **create + push** | Same, and the repo is created under whoever the token authenticates as |
+
+Forking is preferred where it is possible: it records a real fork
+relationship, which is what [Terms of service](#terms-of-service) below is
+about, and a fork arrives with every workflow already disabled.
+
+Creating gets to the same place by a longer road. The new repo is private
+from the start, and its content arrives through the same force-push every
+sync does — the donor's token never needs to read the consumer. One wrinkle
+is handled for you: unlike a fork, a repo created from scratch has Actions
+**enabled**, so its first push would run `test.yml` and any other
+push-triggered workflow on the donor's minutes. `pool-sync` switches Actions
+off before that push (a push with Actions off queues nothing) and the
+per-workflow pass takes it from there. The bracket survives interruption:
+if the first push fails, Actions deliberately stays off, and the next sync
+recognizes the still-empty repo as an unfinished bootstrap and brackets the
+retry the same way. And the *on* side is not bootstrap's alone — every sync
+re-asserts repo-wide Actions for every donor after its push, which is also
+what heals a mirror whose switch was flipped off by hand or lost to a
+transient failure, states in which the mirror silently stops hosting while
+everything else still looks healthy.
+
+For a personal-account donor, `POST /user/repos` creates under whatever
+account the token belongs to, ignoring the `owner` in your config — so
+`pool-sync` checks the token's login against `owner` first and refuses on a
+mismatch rather than putting the mirror somewhere else.
+
+Bootstrap only ever creates on a 404 (and re-brackets only an empty,
+opted-in repo), so re-running a sync never re-creates anything — and it
+only creates: renaming and deleting donor repos stay yours.
 
 ## What the allocator waits for
 
@@ -267,6 +331,26 @@ ok    partial dispatch is cancelled                  "ubuntu-latest"
 22 passed, 0 failed
 ```
 
+`selftest-sync.sh` covers `sync.sh` the same way, with a fake `git` on `PATH`
+alongside the stubbed API so a case can assert that Actions was switched off
+*before* the first push:
+
+```console
+$ .github/scripts/pool/selftest-sync.sh
+ok    existing mirror re-asserts Actions, no bootstrap
+ok    missing repo without bootstrap warns and fails
+ok    org donor on POOL_PAT is forked, then pushed
+ok    fork that never appears is reported, not pushed
+ok    org donor on a fine-grained token is created, push bracketed
+ok    personal donor is created under the matching account
+ok    personal donor whose token is another account is refused
+ok    failed first push leaves Actions off for the retry
+ok    interrupted bootstrap is re-bracketed on retry
+ok    empty mirror without bootstrap gets no bracket
+
+10 passed, 0 failed
+```
+
 No network, no credentials, no repo. Add a case by setting `STUB_*`
 variables and calling `check <name> <expected runs_on>`.
 
@@ -347,11 +431,17 @@ deployment, or publication of the software project associated with the
 repository," and specifically prohibits reselling compute or running
 unrelated workloads.
 
-This design stays inside that line by making every donor a **fork of the
-consumer repo**: the compute a donor contributes runs that repo's own CI.
-That is why step 1 says fork rather than "create an empty repo" — an empty
-repo hosting runners for an unrelated project would be exactly the pattern
-the terms prohibit. Keep it that way.
+This design stays inside that line by making every donor a **fork or mirror
+of the consumer repo**: the compute a donor contributes runs that repo's own
+CI. That is why step 1 says fork rather than "create an empty repo" — an
+empty repo hosting runners for an unrelated project would be exactly the
+pattern the terms prohibit. Keep it that way.
+
+Bootstrap's create path produces a mirror rather than a recorded fork, which
+is why it is the fallback and not the default: where the credential can fork,
+`pool-sync` forks. A created mirror still carries this repo's code and runs
+its CI, so it stays on the right side of the line — the fork relationship is
+simply also visible to GitHub.
 
 Read the current [GitHub Terms for Additional
 Products](https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features#actions)
